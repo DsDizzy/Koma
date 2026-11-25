@@ -1,1 +1,201 @@
 
+-- Koma — Supabase schema v2. Paste ALL of this into Supabase → SQL Editor → Run.
+-- Safe to run again: it wipes and rebuilds Koma's tables (there's no real data yet).
+-- Sign-in is Supabase Auth (bcrypt-hashed passwords, sessions, rate limits).
+-- Every table has Row Level Security: people can only change their own rows.
+
+-- ---------- clean slate ----------
+drop trigger if exists on_auth_user_created on auth.users;
+drop table if exists public.news_comments, public.news_posts, public.replies, public.threads, public.ratings,
+  public.list_items, public.progress, public.panel_scans, public.chapters, public.manga, public.titles,
+  public.creator_verifications, public.profiles cascade;
+drop function if exists public.is_verified(uuid), public.finished(uuid, uuid), public.finished(uuid, text),
+  public.chapters_read(uuid, uuid), public.chapters_read(uuid, text), public.handle_new_user(), public.verif_token() cascade;
+drop policy if exists "readers view pages" on storage.objects;
+drop policy if exists "creators upload own pages" on storage.objects;
+
+-- ---------- people ----------
+create table public.profiles (
+  id uuid primary key references auth.users on delete cascade,
+  username text unique not null check (username ~ '^[a-z0-9_]{3,20}$'),
+  genres text[] not null default '{}',
+  settings jsonb not null default '{"mode":"webtoon","reveal":true,"sound":true,"vol":0.8,"labels":true}',
+  created_at timestamptz not null default now()
+);
+-- a profile is created automatically when someone signs up (username comes from sign-up form)
+create function public.handle_new_user() returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles (id, username) values (new.id, lower(new.raw_user_meta_data->>'username'));
+  return new;
+end $$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.handle_new_user();
+
+create table public.creator_verifications (
+  user_id uuid primary key references public.profiles on delete cascade,
+  pen_name text not null, titles text,
+  declaration_signed_at timestamptz not null default now(),
+  status text not null default 'pending' check (status in ('pending','verified','rejected')),
+  token text unique, reviewed_at timestamptz
+);
+-- when you set status = 'verified' in the Table Editor, a verification token is issued
+create function public.verif_token() returns trigger language plpgsql as $$
+begin
+  if new.status = 'verified' and new.token is null then
+    new.token := 'KOMA-VRF-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 12));
+    new.reviewed_at := now();
+  end if;
+  return new;
+end $$;
+create trigger verif_token before update on public.creator_verifications for each row execute function public.verif_token();
+create function public.is_verified(uid uuid) returns boolean language sql stable security definer set search_path = public as
+$$ select exists(select 1 from creator_verifications where user_id = uid and status = 'verified') $$;
+
+-- ---------- titles & content ----------
+-- every readable title (built-in ones + creator uploads) and how many chapters it has
+create table public.titles (id text primary key, chapter_count int not null default 0);
+insert into public.titles values ('windbound', 2), ('pepper-carrot', 4);
+
+create table public.manga (
+  id uuid primary key default gen_random_uuid(),
+  creator_id uuid not null references public.profiles,
+  title text not null, description text, genres text[] not null default '{}',
+  direction text not null default 'ltr' check (direction in ('ltr','rtl')),
+  cover_path text, created_at timestamptz not null default now()
+);
+create table public.chapters (
+  id uuid primary key default gen_random_uuid(),
+  manga_id uuid not null references public.manga on delete cascade,
+  number int not null, title text not null,
+  pages jsonb not null,
+  published_at timestamptz not null default now(), unique (manga_id, number)
+);
+create table public.panel_scans (panel_id text primary key, tags text[] not null default '{}', text text, scanned_at timestamptz default now());
+
+-- ---------- reading state ----------
+create table public.progress (
+  user_id uuid references public.profiles on delete cascade, manga_id text not null,
+  chapters_done int[] not null default '{}', current_chapter int not null default 0, position int not null default 0,
+  updated_at timestamptz not null default now(), primary key (user_id, manga_id)
+);
+create table public.list_items (user_id uuid references public.profiles on delete cascade, manga_id text not null, added_at timestamptz default now(), primary key (user_id, manga_id));
+
+create function public.finished(uid uuid, mid text) returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select cardinality(chapters_done) from progress where user_id = uid and manga_id = mid), 0)
+       >= greatest(1, coalesce((select chapter_count from titles where id = mid), (select count(*)::int from chapters where manga_id::text = mid), 0)) $$;
+create function public.chapters_read(uid uuid, mid text) returns int language sql stable security definer set search_path = public as $$
+  select coalesce((select max(x) + 1 from progress p, unnest(p.chapters_done) x where p.user_id = uid and p.manga_id = mid), 0) $$;
+
+create table public.ratings (
+  user_id uuid references public.profiles on delete cascade, manga_id text not null,
+  stars int not null check (stars between 1 and 5), primary key (user_id, manga_id)
+);
+
+-- ---------- community ----------
+create table public.threads (
+  id uuid primary key default gen_random_uuid(), manga_id text not null,
+  author_id uuid references public.profiles on delete cascade, author_name text,   -- author_name only for seeded demo posts
+  kind text not null check (kind in ('Discussion','Theory','Reaction','Question')),
+  title text not null check (char_length(title) <= 140), body text not null check (char_length(body) <= 4000),
+  spoiler_ch int not null default 0, created_at timestamptz not null default now()
+);
+create table public.replies (
+  id uuid primary key default gen_random_uuid(), thread_id uuid not null references public.threads on delete cascade,
+  author_id uuid references public.profiles on delete cascade, author_name text,
+  body text not null check (char_length(body) <= 2000),
+  spoiler_ch int not null default 0, created_at timestamptz not null default now()
+);
+create table public.news_posts (
+  id uuid primary key default gen_random_uuid(), kind text not null check (kind in ('headline','creator')),
+  author_id uuid references public.profiles on delete cascade, author_name text, manga_id text, source text, url text,
+  title text not null check (char_length(title) <= 160), body text not null check (char_length(body) <= 4000),
+  created_at timestamptz not null default now()
+);
+create table public.news_comments (
+  id uuid primary key default gen_random_uuid(), post_id uuid not null references public.news_posts on delete cascade,
+  author_id uuid references public.profiles on delete cascade, author_name text,
+  body text not null check (char_length(body) <= 600), created_at timestamptz not null default now()
+);
+
+-- ---------- Row Level Security ----------
+alter table public.profiles enable row level security;
+alter table public.creator_verifications enable row level security;
+alter table public.titles enable row level security;
+alter table public.manga enable row level security;
+alter table public.chapters enable row level security;
+alter table public.panel_scans enable row level security;
+alter table public.progress enable row level security;
+alter table public.list_items enable row level security;
+alter table public.ratings enable row level security;
+alter table public.threads enable row level security;
+alter table public.replies enable row level security;
+alter table public.news_posts enable row level security;
+alter table public.news_comments enable row level security;
+
+create policy "usernames are public" on public.profiles for select to anon, authenticated using (true);
+create policy "edit own profile" on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
+
+create policy "see own verification" on public.creator_verifications for select to authenticated using (user_id = auth.uid());
+create policy "apply once" on public.creator_verifications for insert to authenticated with check (user_id = auth.uid() and status = 'pending' and token is null);
+-- approving happens in the Supabase dashboard (Table Editor), never from the app
+
+create policy "titles readable" on public.titles for select to anon, authenticated using (true);
+create policy "manga readable" on public.manga for select to authenticated using (true);
+create policy "verified creators publish" on public.manga for insert to authenticated with check (creator_id = auth.uid() and public.is_verified(auth.uid()));
+create policy "creators edit own" on public.manga for update to authenticated using (creator_id = auth.uid());
+create policy "chapters readable" on public.chapters for select to authenticated using (true);
+create policy "creators add chapters" on public.chapters for insert to authenticated
+  with check (exists(select 1 from public.manga m where m.id = manga_id and m.creator_id = auth.uid()) and public.is_verified(auth.uid()));
+create policy "scans readable" on public.panel_scans for select to authenticated using (true);
+
+create policy "own progress" on public.progress for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+create policy "own list" on public.list_items for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+create policy "ratings readable" on public.ratings for select to authenticated using (true);
+create policy "rate only when finished" on public.ratings for insert to authenticated with check (user_id = auth.uid() and public.finished(auth.uid(), manga_id));
+create policy "re-rate own" on public.ratings for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid() and public.finished(auth.uid(), manga_id));
+
+create policy "threads readable" on public.threads for select to authenticated using (true);
+-- you can only tag a post with chapters you have actually finished
+create policy "post threads" on public.threads for insert to authenticated
+  with check (author_id = auth.uid() and author_name is null and spoiler_ch <= public.chapters_read(auth.uid(), manga_id));
+create policy "delete own threads" on public.threads for delete to authenticated using (author_id = auth.uid());
+create policy "replies readable" on public.replies for select to authenticated using (true);
+create policy "post replies" on public.replies for insert to authenticated
+  with check (author_id = auth.uid() and author_name is null and spoiler_ch <= public.chapters_read(auth.uid(), (select t.manga_id from public.threads t where t.id = thread_id)));
+create policy "delete own replies" on public.replies for delete to authenticated using (author_id = auth.uid());
+
+create policy "news readable" on public.news_posts for select to authenticated using (true);
+create policy "verified creators post news" on public.news_posts for insert to authenticated
+  with check (kind = 'creator' and author_id = auth.uid() and author_name is null and public.is_verified(auth.uid()));
+create policy "comments readable" on public.news_comments for select to authenticated using (true);
+create policy "post comments" on public.news_comments for insert to authenticated with check (author_id = auth.uid() and author_name is null);
+
+-- page images: private bucket, readers get short-lived signed URLs
+insert into storage.buckets (id, name, public) values ('pages', 'pages', false) on conflict do nothing;
+create policy "readers view pages" on storage.objects for select to authenticated using (bucket_id = 'pages');
+create policy "creators upload own pages" on storage.objects for insert to authenticated
+  with check (bucket_id = 'pages' and (storage.foldername(name))[1] = auth.uid()::text and public.is_verified(auth.uid()));
+
+-- ---------- sample community posts (demo users) ----------
+with t as (insert into public.threads (manga_id, author_name, kind, title, body, spoiler_ch, created_at) values
+ ('windbound','nova','Theory','Who is following Rei through the forest?','The footsteps start right after the river. My bet: someone who knows her route really well. Nobody else would know where she crosses.',1, now() - interval '30 hours'),
+ ('windbound','pixel','Discussion','The masked swordsman being her brother Kaito changes everything','So Kaito was the one chasing her the whole time. He wanted the letter because it''s about their father. Rereading chapter 1 with that in mind hits different.',2, now() - interval '18 hours'),
+ ('windbound','aki','Reaction','Reading the valley pages with sound on is unreal','Birds at dawn, then the breeze, then the river. Then the wind turns harsh right before the masked guy shows up. Perfect build.',1, now() - interval '10 hours'),
+ ('pepper-carrot','ren','Reaction','The rain in the birthday episode with sound on','Episode 8 goes from sunny attic to a full thunderstorm. With rain + thunder playing it actually feels lonely.',3, now() - interval '5 hours'),
+ ('ashen-crown','grimm','Theory','The queen already knows where the crown is','Chapter 12 shows her ring matching the crown gems. She has been playing both sides since the coronation.',12, now() - interval '6 hours')
+ returning id, title)
+insert into public.replies (thread_id, author_name, body, spoiler_ch, created_at)
+select id, r.author, r.body, r.ch, now() - r.ago from t join (values
+ ('Who is following Rei through the forest?','aki','The mask looks handmade. Not a professional bandit.',1, interval '28 hours'),
+ ('Who is following Rei through the forest?','grimm','Without saying too much... watch how he holds back when they fight. He never swings at her head.',2, interval '20 hours'),
+ ('The masked swordsman being her brother Kaito changes everything','ren','The scar on his cheek! You can see it the moment the mask cracks.',2, interval '16 hours')
+) as r(title, author, body, ch, ago) on r.title = t.title;
+
+with n as (insert into public.news_posts (kind, author_name, manga_id, source, title, body, created_at) values
+ ('headline',null,'windbound','Koma News Desk','Windbound chapter 3 is scheduled for December','The studio says chapter 3 picks up the morning after the fire, with a new location: the courier guild in the capital.', now() - interval '5 hours'),
+ ('headline',null,'pepper-carrot','Koma News Desk','Pepper&Carrot added to Koma','Four episodes of David Revoy''s free, open-source webcomic are now readable with ambient sound. Licensed CC-BY 4.0.', now() - interval '1 hour'),
+ ('creator','komastudio','windbound',null,'Chapter 3 thumbnails are done','Thanks for reading Windbound! Chapter 3 is fully thumbnailed. Expect more wind, a city full of footsteps, and one very loud bell.', now() - interval '8 hours')
+ returning id, kind)
+insert into public.news_comments (post_id, author_name, body, created_at)
+select id, c.a, c.b, now() - c.ago from n, (values ('aki','A city full of footsteps with the sound on is going to be wild.', interval '7 hours'),('nova','Please give Kaito more panels!', interval '6 hours')) as c(a,b,ago)
+where n.kind = 'creator';
